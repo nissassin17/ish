@@ -509,21 +509,20 @@ void execute_job_list(job* curr_job, char *envp[], queue_t *background_jobs){
 
 }
 
+int stopped_job_filter(void *vjob){
+	job *jjob = vjob;
+	return jjob->status == JOB_STOPPED;
+}
+
 //continue one stopped job
 //iterate background_jobs, find first stopped job and continue execution
 //if not found, print "there is no stopped job"
 int job_bg(char *envp[], queue_t *background_jobs){
-	queue_node_t *node;
-	int found = 0;
-	for(node = background_jobs->front; node != NULL; node = node->next){
-		job *curr_job = node->data;
-		if (curr_job->status == JOB_STOPPED){
-			execute_job_list_(curr_job, envp, background_jobs, 0);
-			found = 1;
-			break;
-		}
-	}
-	return found;
+	job *curr_job = queue_filter(background_jobs, stopped_job_filter);
+	if (curr_job == NULL)
+		return 0;
+	execute_job_list_(curr_job, envp, background_jobs, 0);
+	return 1;
 }
 
 //find first first UNFINISHED job (stopped or running), bring to foreground (tcsetpgrp and waitpid)
