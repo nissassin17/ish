@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -O
-SRCS = parse.c main.c print.c
+SRCS = parse.c main.c print.c queue.c
 OBJS = $(SRCS:.c=.o)
 
 TARGET = ish
