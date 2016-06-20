@@ -7,6 +7,7 @@
 #define LINELEN 256   /* 入力コマンドの長さ */
 #define FILE_NOT_FOUND_MSG "File not found"
 #include <signal.h>
+#include "queue.h"
 
 typedef enum write_option_ {
     TRUNC,
@@ -30,10 +31,18 @@ typedef enum job_mode_ {
     BACKGROUND,
 } job_mode;
 
+typedef enum {
+	JOB_FINISHED = 0,
+	JOB_STOPPED = 1,
+	JOB_RUNNING = 2
+} job_status_t;
+
 typedef struct job_ {
     job_mode     mode;
     process*     process_list;
+	process* curr_process;
     struct job_* next;
+	job_status_t status;
 } job;
 void setup_job_handler();
 
@@ -48,6 +57,9 @@ char* get_line(char *, int);
 job* parse_line(char *);
 void free_job(job *);
 
-void execute_job_list(job*, char *[]);
+void execute_job_list(job*, char *[], queue_t*);
+
+int job_bg(char *[], queue_t*);
+int job_fg(char *[], queue_t*);
 
 #endif
