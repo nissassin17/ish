@@ -34,15 +34,20 @@ typedef enum job_mode_ {
 typedef enum {
 	JOB_FINISHED = 0,
 	JOB_STOPPED = 1,
-	JOB_RUNNING = 2
+	JOB_RUNNING = 2,
+	JOB_NOTRUN
 } job_status_t;
 
 typedef struct job_ {
     job_mode     mode;
     process*     process_list;
-	process* curr_process;
     struct job_* next;
+
+	pid_t pid;
+	process* curr_process;
 	job_status_t status;
+	int pipefd[4];
+	int current_fd, last_fd;
 } job;
 void setup_job_handler();
 

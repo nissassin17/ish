@@ -10,6 +10,7 @@
 #include "parse.h"
 #include <sys/stat.h>
 #include "queue.h"
+#include <pthread.h>
 
 /* 標準入力から最大size-1個の文字を改行またはEOFまで読み込み、sに設定する */
 char* get_line(char *s, int size) {
@@ -105,6 +106,7 @@ static job* initialize_job() {
 	j->mode = FOREGROUND;
 	j->process_list = initialize_process();
 	j->next = NULL;
+	j->status = JOB_NOTRUN;
 
 	return j;
 }
@@ -268,121 +270,133 @@ void setup_zombier_cleaner(){
 	handler.sa_mask = empty;
 	sigaction(SIGCHLD, &handler, NULL);
 }
-int execute_job_(job *curr_job, char *envp[], pid_t ppid, int is_first_run){
-	//setup before running
-	sigset_t mask, omask;
+
+void execute_process(process *curr_process, int *pipefd, int *current, int *last, char *envp[]){
+	//unblock signals
+	sigset_t mask;
 	sigemptyset(&mask);
 	sigaddset(&mask, SIGINT);
 	sigaddset(&mask, SIGTSTP);
-	if (sigprocmask(SIG_BLOCK, &mask, &omask) == -1)
+	if (sigprocmask(SIG_UNBLOCK, &mask, NULL) == -1)
 		perror("sigprocmask");
 
-	process *curr_process;
-	int pipefd[4];
-	int current = 0, last = -1;
+	int fd;
 	const int infd = 0, outfd = 1;
-	int grpid = getpid();
+	//setup output
+	if (curr_process->output_redirection != NULL){
+		mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
+		if (curr_process->output_option == APPEND){
+			fd = open(curr_process->output_redirection, O_WRONLY | O_APPEND | O_CREAT, mode);
+		}else{
+			fd = open(curr_process->output_redirection, O_WRONLY | O_CREAT | O_TRUNC, mode);
+		}
+		if (fd == -1){
+			perror("open");
+			exit(EXIT_FAILURE);
+		}
+		if (dup2(fd, STDOUT_FILENO) == -1) perror("dup2");
+		if (close(fd) == -1) perror("close");
+	}else
+		if (curr_process->next != NULL)
+			if (dup2(pipefd[*current + outfd], STDOUT_FILENO) == -1) perror("dup2");
+	//setup input
+	if (curr_process->input_redirection != NULL){
+		int fd = open(curr_process->input_redirection, O_RDONLY);
+		if (fd == -1){
+			perror("open");
+			exit(EXIT_FAILURE);
+		}else{
+			if (dup2(fd, STDIN_FILENO) == -1) perror("dup2");
+			if (close(fd) == -1) perror("close");
+		}
+	}
+	else if (*last != -1)
+		if (dup2(pipefd[*last + infd], STDIN_FILENO) == -1) perror("dup2");
+
+	//close last pipes only if this is not first process
+	if (*last != -1){
+		if (close(pipefd[*last + infd]) == -1) perror("close");
+		if (close(pipefd[*last + outfd]) == -1) perror("close");
+	}
+	//always close current pipes
+	if (close(pipefd[*current + infd]) == -1) perror("close");
+	if (close(pipefd[*current + outfd]) == -1) perror("close");
+	char full_path[LINELEN];
+	if (!get_full_path(full_path, curr_process->program_name))
+		fprintf(stderr, "%s\n", FILE_NOT_FOUND_MSG);
+	else
+		if (execve(full_path, curr_process->argument_list, envp) == -1) perror("execve");
+	exit(EXIT_FAILURE);
+}
+
+//in a shell's thread
+int execute_job_(job *curr_job, char *envp[], pid_t ppid){
+	process *curr_process;
+	int shell_ppid = getppid();
+	int job_ppid = -1;
+	const int infd = 0, outfd = 1;
 	//setpgid(grpid, grpid); //-> already setup outside
 	//loop
-	if (is_first_run)
+	if (curr_job->status == JOB_NOTRUN){
+		//first run setup
 		curr_job->status = JOB_RUNNING;
-	for(curr_process = (!is_first_run && curr_job->status == JOB_STOPPED) ? curr_job->curr_process : curr_job->process_list; curr_process != NULL; curr_process = curr_process->next){
-		if (pipe(pipefd + current) == -1)
+		curr_job->current_fd = 0;
+		curr_job->last_fd = -1;
+	}
+	for(curr_process = curr_job->status == JOB_STOPPED ? curr_job->curr_process : curr_job->process_list; curr_process != NULL; curr_process = curr_process->next){
+		if (pipe(curr_job->pipefd + curr_job->current_fd) == -1){
+			curr_job->status = JOB_FINISHED;
 			perror("pipe");
+		}
 		//connect input of pipefd[0] <-> output of pipefd[1]
-		pid_t pid;
-		if (!is_first_run && curr_job->status == JOB_STOPPED){
-			//pid = curr_job->pid;
+		if (curr_job->status == JOB_STOPPED){
+			curr_job->pid = curr_job->pid;
+			//continue last stopped process
+			kill(curr_job->pid, SIGCONT);
 			//this pid'parent child currently not grpid
 			//change its parent to grpid -> IMPOSSIBLE
 		}else{
-			pid = fork();
+			curr_job->pid = fork();
 		}
 		curr_job->status = JOB_RUNNING;
-		if (pid == 0){
+		if (curr_job->pid == 0){
 			//child
-			//unblock signals
-			sigset_t mask, omask;
-			sigemptyset(&mask);
-			sigaddset(&mask, SIGINT);
-			sigaddset(&mask, SIGTSTP);
-			if (sigprocmask(SIG_UNBLOCK, &mask, &omask) == -1)
-				perror("sigprocmask");
-
-			int fd;
-			//setup output
-			if (curr_process->output_redirection != NULL){
-				mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
-				if (curr_process->output_option == APPEND){
-					fd = open(curr_process->output_redirection, O_WRONLY | O_APPEND | O_CREAT, mode);
-				}else{
-					fd = open(curr_process->output_redirection, O_WRONLY | O_CREAT | O_TRUNC, mode);
-				}
-				if (fd == -1){
-					perror("open");
-					exit(EXIT_FAILURE);
-				}
-				if (dup2(fd, STDOUT_FILENO) == -1) perror("dup2");
-				if (close(fd) == -1) perror("close");
-			}else
-				if (curr_process->next != NULL)
-					if (dup2(pipefd[current + outfd], STDOUT_FILENO) == -1) perror("dup2");
-			//setup input
-			if (curr_process->input_redirection != NULL){
-				int fd = open(curr_process->input_redirection, O_RDONLY);
-				if (fd == -1){
-					perror("open");
-					exit(EXIT_FAILURE);
-				}else{
-					if (dup2(fd, STDIN_FILENO) == -1) perror("dup2");
-					if (close(fd) == -1) perror("close");
-				}
-			}
-			else if (last != -1)
-				if (dup2(pipefd[last + infd], STDIN_FILENO) == -1) perror("dup2");
-
-			//close last pipes only if this is not first process
-			if (last != -1){
-				if (close(pipefd[last + infd]) == -1) perror("close");
-				if (close(pipefd[last + outfd]) == -1) perror("close");
-			}
-			//always close current pipes
-			if (close(pipefd[current + infd]) == -1) perror("close");
-			if (close(pipefd[current + outfd]) == -1) perror("close");
-			char full_path[LINELEN];
-			if (!get_full_path(full_path, curr_process->program_name))
-				fprintf(stderr, "%s\n", FILE_NOT_FOUND_MSG);
-			else
-				if (execve(full_path, curr_process->argument_list, envp) == -1) perror("execve");
-			exit(EXIT_FAILURE);
+			execute_process(curr_process, curr_job->pipefd, &curr_job->current_fd, &curr_job->last_fd, envp);
 		}else{
-			if (pid == -1){
+			if (curr_job->pid == -1){
 				perror("fork");
 				break;
-				//exit(EXIT_FAILURE);
 			}
 			else{
 				//parent
-				if (setpgid(pid, grpid) == -1)
+				if (job_ppid == -1){
+					//first job after stopped or when start from begin
+					job_ppid = curr_job->pid;
+					if (setpgid(curr_job->pid, job_ppid) == -1)
+						perror("setpgid");
+					if (curr_job->mode == FOREGROUND){
+						//bring to front
+						if (tcsetpgrp(STDIN_FILENO, job_ppid) == -1)
+							perror("tcsetgrp");
+					}
+				}else
+				if (setpgid(curr_job->pid, job_ppid) == -1)
 					perror("setpgid");
 				//wait
-				if (last != -1){
+				if (curr_job->last_fd != -1){
 					//not first process
-					if (close(pipefd[last + infd]) == -1) perror("close");
-					if (close(pipefd[last + outfd]) == -1) perror("close");
+					if (close(curr_job->pipefd[curr_job->last_fd + infd]) == -1) perror("close");
+					if (close(curr_job->pipefd[curr_job->last_fd + outfd]) == -1) perror("close");
 				}
 				if (curr_process->next == NULL){
 					//last process
-					if (close(pipefd[current+outfd]) == -1) perror("close");
-					if (close(pipefd[current+infd]) == -1) perror("close");
+					if (close(curr_job->pipefd[curr_job->current_fd+outfd]) == -1) perror("close");
+					if (close(curr_job->pipefd[curr_job->current_fd+infd]) == -1) perror("close");
 				}
-				if (last == -1)
-					last = 2;
-				int tmp = current;
-				current = last;
-				last = tmp;
+				if (curr_job->last_fd == -1)
+					curr_job->last_fd = 2;
 				int status;
-				if (waitpid(pid, &status, WUNTRACED) == -1)
+				if (waitpid(curr_job->pid, &status, WUNTRACED) == -1)
 					perror("waitpid");
 				if (WIFEXITED(status)){
 					//printf("exited: %d\n", WEXITSTATUS(status));
@@ -404,17 +418,27 @@ int execute_job_(job *curr_job, char *envp[], pid_t ppid, int is_first_run){
 					//by ctrl-z
 					//restore foreground
 					curr_job->status = JOB_STOPPED;
+					//dont close pipe
 					break;
 				}
+				int tmp = curr_job->current_fd;
+				curr_job->current_fd = curr_job->last_fd;
+				curr_job->last_fd = tmp;
 			}
 		}
 	}
+
+	//NOTE NOTE NOTE: cannot restore shell to foreground without wrapping process by another fork
 	//restore shell to foreground
 	if (curr_job->mode == FOREGROUND)
-		if (tcsetpgrp(STDIN_FILENO, ppid) == -1)
+		if (tcsetpgrp(STDIN_FILENO, shell_ppid) == -1)
 			perror("tcsetpgrp");
-	if (curr_job->status != JOB_STOPPED)
+	if (curr_job->status != JOB_STOPPED){
 		curr_job->status = JOB_FINISHED;
+		//close pipes
+		if (close(curr_job->pipefd[curr_job->current_fd + infd]) == -1) perror("close");
+		if (close(curr_job->pipefd[curr_job->current_fd + outfd]) == -1) perror("close");
+	}
 	return curr_job->status;
 }
 
@@ -431,78 +455,86 @@ void setup_job_handler(){
 	setup_zombier_cleaner();
 }
 
+typedef struct {
+	job *curr_job;
+	char *envp[];
+	queue_t *background_jobs;
+	int is_first_run;
+} execute_job_arg;
+
+void *execute_job_cb(void *arg){
+	execute_job_arg *job_arg = arg;
+	execute_job_(job_arg->curr_job, job_arg->envp, job_arg->ppid, job_arg->is_first_run);
+}
+
 //do not forget to call free_job
 //unless job is added to queue
 void execute_job_list_(job* curr_job, char *envp[], queue_t *background_jobs, int is_first_run){
 
 	pid_t ppid = getpgrp();
-	pid_t pid = fork();
-	if (pid == 0){
-		//child
-		setup_zombier_cleaner();
+	execute_job_arg *arg = malloc(sizeof(execute_job_arg));
+	arg->curr_job = curr_job;
+	arg->envp = envp;
+	arg->background_jobs = background_jobs;
+	arg->is_first_run = is_first_run;
+	pthread_t thread;
+	if (pthread_create(&thread, NULL, execute_job_cb, arg) == -1){
+		perror("pthread_create");
+		free_job(job);
+		free(arg);
+	}else{
 
-		int status = execute_job_(curr_job, envp, ppid, is_first_run);
-		free_job(curr_job);
-		//this exit will kill running process
-		exit(status);
-
-		//there currently is no protocol to notify parent process which is current process
-	}else if (pid == -1){
-		perror("fork");
-		free_job(curr_job);
-	}
-	else{
-		//parent
-		//set group id
-		setpgid(pid, pid);
-		if (curr_job->mode == FOREGROUND){
-			//bring to foreground
-			if (tcsetpgrp(STDIN_FILENO, pid) == -1)
-				perror("tcsetpgrp");
-			int status;
-			waitpid(pid, &status, WUNTRACED);
-			if (WIFEXITED(status)){
-				//normal exit
-				if (WEXITSTATUS(status) == JOB_STOPPED ){
-					//INCOMPLETE_JOB
-					curr_job->status = JOB_STOPPED;
-					queue_push_back(background_jobs, curr_job);
-					//do not free_job
-				}else if (WEXITSTATUS(status) == JOB_FINISHED) {
-					curr_job->status = JOB_FINISHED;
-					free_job(curr_job);
-				} else{
-					curr_job->status = JOB_RUNNING;
-					free_job(curr_job);
-					//JOB_RUNNING
-					//never happend
-				}
-			}else if (WIFSIGNALED(status)){
-				free_job(curr_job);
-				//never happen
-				//exit by signal
-			}else{
-				free_job(curr_job);
-				//never happen
-				//WIFSTOPPED
-				//by ctrl-z
-			}
-		}else{
-			//run background
-			//do not free_job
-			curr_job->status = JOB_RUNNING;
-			if (is_first_run)
-				//only push to queue in first run
-				//from second run (continued by fg or bg), job has already been added to queue
+	//there currently is no protocol to notify parent process which is current process
+	if (curr_job->mode == FOREGROUND){
+		pthread_join(thread);
+		//bring to foreground
+		if (tcsetpgrp(STDIN_FILENO, pid) == -1)
+			perror("tcsetpgrp");
+		int status;
+		waitpid(pid, &status, WUNTRACED);
+		if (WIFEXITED(status)){
+			//normal exit
+			if (WEXITSTATUS(status) == JOB_STOPPED ){
+				//INCOMPLETE_JOB
+				curr_job->status = JOB_STOPPED;
 				queue_push_back(background_jobs, curr_job);
-			else{
-				//NOT sure yet
-				//brought to foreground by fg
-				//change mode to foreground
+				//do not free_job
+			}else if (WEXITSTATUS(status) == JOB_FINISHED) {
+				curr_job->status = JOB_FINISHED;
+				free_job(curr_job);
+			} else{
+				curr_job->status = JOB_RUNNING;
+				free_job(curr_job);
+				//JOB_RUNNING
+				//never happend
 			}
+		}else if (WIFSIGNALED(status)){
+			free_job(curr_job);
+			//never happen
+			//exit by signal
+		}else{
+			free_job(curr_job);
+			//never happen
+			//WIFSTOPPED
+			//by ctrl-z
 		}
-
+	}else{
+		//run background
+		//do not free_job
+		curr_job->status = JOB_RUNNING;
+		if (is_first_run)
+			//only push to queue in first run
+			//from second run (continued by fg or bg), job has already been added to queue
+			queue_push_back(background_jobs, curr_job);
+		else{
+			//NOT sure yet
+			//brought to foreground by fg
+			//change mode to foreground
+		}
 	}
+}
+
+
 }
 void execute_job_list(job* curr_job, char *envp[], queue_t *background_jobs){
 	execute_job_list_(curr_job, envp, background_jobs, 1);
