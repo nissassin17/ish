@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include "queue.h"
 #include <pthread.h>
+#include "common.h"
 
 /* 標準入力から最大size-1個の文字を改行またはEOFまで読み込み、sに設定する */
 char* get_line(char *s, int size) {
@@ -277,8 +278,7 @@ void execute_process(process *curr_process, int *pipefd, int *current, int *last
 	sigemptyset(&mask);
 	sigaddset(&mask, SIGINT);
 	sigaddset(&mask, SIGTSTP);
-	if (sigprocmask(SIG_UNBLOCK, &mask, NULL) == -1)
-		perror("sigprocmask");
+	CHECK(sigprocmask(SIG_UNBLOCK, &mask, NULL));
 
 	int fd;
 	const int infd = 0, outfd = 1;
@@ -330,10 +330,10 @@ void execute_process(process *curr_process, int *pipefd, int *current, int *last
 }
 
 //in a shell's thread
-int execute_job_(job *curr_job, char *envp[], pid_t ppid){
+int execute_job_(job *curr_job, char *envp[]){
 	process *curr_process;
-	int shell_ppid = getppid();
-	int job_ppid = -1;
+	int shell_pgrp = getpgrp();
+	int job_pgrp = -1;
 	const int infd = 0, outfd = 1;
 	//setpgid(grpid, grpid); //-> already setup outside
 	//loop
@@ -365,22 +365,27 @@ int execute_job_(job *curr_job, char *envp[], pid_t ppid){
 		}else{
 			if (curr_job->pid == -1){
 				perror("fork");
+				//close pipes
+				if (close(curr_job->pipefd[curr_job->current_fd + infd]) == -1) perror("close");
+				if (close(curr_job->pipefd[curr_job->current_fd + outfd]) == -1) perror("close");
 				break;
 			}
 			else{
 				//parent
-				if (job_ppid == -1){
+				if (job_pgrp == -1){
 					//first job after stopped or when start from begin
-					job_ppid = curr_job->pid;
-					if (setpgid(curr_job->pid, job_ppid) == -1)
+					job_pgrp = curr_job->pid;
+					if (setpgid(curr_job->pid, job_pgrp) == -1)
 						perror("setpgid");
 					if (curr_job->mode == FOREGROUND){
 						//bring to front
-						if (tcsetpgrp(STDIN_FILENO, job_ppid) == -1)
+						if (tcsetpgrp(STDIN_FILENO, job_pgrp) == -1)
 							perror("tcsetgrp");
+						//change shell's pgrp to current foreground so that it can rescue its self later
+						setpgid(getpid(), job_pgrp);
 					}
 				}else
-				if (setpgid(curr_job->pid, job_ppid) == -1)
+				if (setpgid(curr_job->pid, job_pgrp) == -1)
 					perror("setpgid");
 				//wait
 				if (curr_job->last_fd != -1){
@@ -430,25 +435,25 @@ int execute_job_(job *curr_job, char *envp[], pid_t ppid){
 
 	//NOTE NOTE NOTE: cannot restore shell to foreground without wrapping process by another fork
 	//restore shell to foreground
-	if (curr_job->mode == FOREGROUND)
-		if (tcsetpgrp(STDIN_FILENO, shell_ppid) == -1)
+	if (curr_job->mode == FOREGROUND){
+		if (tcsetpgrp(STDIN_FILENO, shell_pgrp) == -1)
 			perror("tcsetpgrp");
+		//restore old pgrp
+		setpgid(getpid(), shell_pgrp);
+	}
 	if (curr_job->status != JOB_STOPPED){
 		curr_job->status = JOB_FINISHED;
-		//close pipes
-		if (close(curr_job->pipefd[curr_job->current_fd + infd]) == -1) perror("close");
-		if (close(curr_job->pipefd[curr_job->current_fd + outfd]) == -1) perror("close");
 	}
 	return curr_job->status;
 }
 
 void setup_job_handler(){
 	//setup signal
-	sigset_t mask, omask;
+	sigset_t mask;
 	sigemptyset(&mask);
 	sigaddset(&mask, SIGINT);
 	sigaddset(&mask, SIGTSTP);
-	if (sigprocmask(SIG_BLOCK, &mask, &omask) == -1)
+	if (sigprocmask(SIG_BLOCK, &mask, NULL) == -1)
 		perror("sigprocmask");
 
 	//zombier cleaner
@@ -457,71 +462,54 @@ void setup_job_handler(){
 
 typedef struct {
 	job *curr_job;
-	char *envp[];
+	char **envp;
 	queue_t *background_jobs;
-	int is_first_run;
 } execute_job_arg;
 
 void *execute_job_cb(void *arg){
 	execute_job_arg *job_arg = arg;
-	execute_job_(job_arg->curr_job, job_arg->envp, job_arg->ppid, job_arg->is_first_run);
+	execute_job_(job_arg->curr_job, job_arg->envp);
+	return NULL;
 }
 
 //do not forget to call free_job
 //unless job is added to queue
-void execute_job_list_(job* curr_job, char *envp[], queue_t *background_jobs, int is_first_run){
+void execute_job_list(job* curr_job, char *envp[], queue_t *background_jobs){
 
-	pid_t ppid = getpgrp();
+	int is_first_run = curr_job->status == JOB_NOTRUN;
 	execute_job_arg *arg = malloc(sizeof(execute_job_arg));
 	arg->curr_job = curr_job;
 	arg->envp = envp;
 	arg->background_jobs = background_jobs;
-	arg->is_first_run = is_first_run;
 	pthread_t thread;
 	if (pthread_create(&thread, NULL, execute_job_cb, arg) == -1){
 		perror("pthread_create");
-		free_job(job);
+		free_job(curr_job);
 		free(arg);
 	}else{
 
 	//there currently is no protocol to notify parent process which is current process
 	if (curr_job->mode == FOREGROUND){
-		pthread_join(thread);
-		//bring to foreground
-		if (tcsetpgrp(STDIN_FILENO, pid) == -1)
-			perror("tcsetpgrp");
-		int status;
-		waitpid(pid, &status, WUNTRACED);
-		if (WIFEXITED(status)){
-			//normal exit
-			if (WEXITSTATUS(status) == JOB_STOPPED ){
-				//INCOMPLETE_JOB
-				curr_job->status = JOB_STOPPED;
+		//foreground
+		void *result;
+		pthread_join(thread, &result);
+		if (curr_job->status == JOB_STOPPED){
+			//only push to queue if this is first time job launched
+			if (!is_first_run)
 				queue_push_back(background_jobs, curr_job);
-				//do not free_job
-			}else if (WEXITSTATUS(status) == JOB_FINISHED) {
-				curr_job->status = JOB_FINISHED;
-				free_job(curr_job);
-			} else{
-				curr_job->status = JOB_RUNNING;
-				free_job(curr_job);
-				//JOB_RUNNING
-				//never happend
-			}
-		}else if (WIFSIGNALED(status)){
-			free_job(curr_job);
-			//never happen
-			//exit by signal
 		}else{
-			free_job(curr_job);
-			//never happen
-			//WIFSTOPPED
-			//by ctrl-z
+			//remove from background jobs queue if this is not first run
+			if (!is_first_run){
+				//free_job will be called from the next method
+				queue_remove_by_data(background_jobs, curr_job);
+			}
+			else
+				free_job(curr_job);
+
 		}
 	}else{
 		//run background
 		//do not free_job
-		curr_job->status = JOB_RUNNING;
 		if (is_first_run)
 			//only push to queue in first run
 			//from second run (continued by fg or bg), job has already been added to queue
@@ -536,11 +524,6 @@ void execute_job_list_(job* curr_job, char *envp[], queue_t *background_jobs, in
 
 
 }
-void execute_job_list(job* curr_job, char *envp[], queue_t *background_jobs){
-	execute_job_list_(curr_job, envp, background_jobs, 1);
-
-}
-
 int stopped_job_filter(void *vjob){
 	job *jjob = vjob;
 	return jjob->status == JOB_STOPPED;
@@ -553,7 +536,7 @@ int job_bg(char *envp[], queue_t *background_jobs){
 	job *curr_job = queue_filter(background_jobs, stopped_job_filter);
 	if (curr_job == NULL)
 		return 0;
-	execute_job_list_(curr_job, envp, background_jobs, 0);
+	execute_job_list(curr_job, envp, background_jobs);
 	return 1;
 }
 

@@ -27,4 +27,6 @@ int queue_is_empty(queue_t*);
 
 //return NULL unless found
 void *queue_filter(queue_t *queue, int (*asserter)(void*));
+
+void queue_remove_by_data(queue_t *queue, void *data);
 #endif

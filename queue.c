@@ -89,3 +89,29 @@ void *queue_filter(queue_t *queue, int (*asserter)(void*)){
 	queue_unlock(queue);
 	return data;
 }
+void queue_remove_by_data(queue_t *queue, void *data){
+	queue_lock(queue);
+	queue_node_t *node, *found_node = NULL;
+	for(node = queue->front; node != NULL; node = node->next)
+		if (node->data == data){
+			found_node = node;
+			break;
+		}
+	//remove node
+	if (found_node != NULL){
+		if (found_node == queue->front){
+			queue->front = queue->back = NULL;
+		}else{
+			for(node = queue->front; node->next != NULL; node = node->next){
+				if (node->next == found_node){
+					if (queue->back == found_node)
+						queue->back = node;
+					node->next = found_node->next;
+					break;
+				}
+			}
+		}
+		queue_node_destroy(found_node);
+	}
+	queue_unlock(queue);
+}
