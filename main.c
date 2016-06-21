@@ -42,7 +42,7 @@ int main(int argc, char *argv[], char *envp[]) {
 
     }
 
-	while(!queue_empty(background_jobs)){
+	while(!queue_is_empty(background_jobs)){
 		kill_job(queue_pop_front(background_jobs));
 	}
 	queue_destroy(background_jobs);

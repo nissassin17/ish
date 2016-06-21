@@ -261,7 +261,7 @@ char *get_full_path(char *full_path, char *program_name){
 }
 
 
-void execute_process(process *curr_process, int *pipefd, int *current, int *last, char *envp[]){
+void execute_process(job *curr_job, char *envp[]){
 	//unblock signals
 	sigset_t mask;
 	sigemptyset(&mask);
@@ -272,12 +272,12 @@ void execute_process(process *curr_process, int *pipefd, int *current, int *last
 
 	int fd;
 	//setup output
-	if (curr_process->output_redirection != NULL){
+	if (curr_job->curr_process->output_redirection != NULL){
 		mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
-		if (curr_process->output_option == APPEND){
-			fd = open(curr_process->output_redirection, O_WRONLY | O_APPEND | O_CREAT, mode);
+		if (curr_job->curr_process->output_option == APPEND){
+			fd = open(curr_job->curr_process->output_redirection, O_WRONLY | O_APPEND | O_CREAT, mode);
 		}else{
-			fd = open(curr_process->output_redirection, O_WRONLY | O_CREAT | O_TRUNC, mode);
+			fd = open(curr_job->curr_process->output_redirection, O_WRONLY | O_CREAT | O_TRUNC, mode);
 		}
 		if (fd == -1){
 			perror("open");
@@ -286,11 +286,11 @@ void execute_process(process *curr_process, int *pipefd, int *current, int *last
 		CHECK(dup2(fd, STDOUT_FILENO));
 		CHECK(close(fd));
 	}else
-		if (curr_process->next != NULL)
-			CHECK(dup2(pipefd[*current + OUTFD], STDOUT_FILENO));
+		if (curr_job->curr_process->next != NULL)
+			CHECK(dup2(curr_job->pipefd[curr_job->current_fd + OUTFD], STDOUT_FILENO));
 	//setup input
-	if (curr_process->input_redirection != NULL){
-		int fd = open(curr_process->input_redirection, O_RDONLY);
+	if (curr_job->curr_process->input_redirection != NULL){
+		int fd = open(curr_job->curr_process->input_redirection, O_RDONLY);
 		if (fd == -1){
 			perror("open");
 			exit(EXIT_FAILURE);
@@ -299,22 +299,22 @@ void execute_process(process *curr_process, int *pipefd, int *current, int *last
 			CHECK(close(fd));
 		}
 	}
-	else if (*last != -1)
-		CHECK(dup2(pipefd[*last + INFD], STDIN_FILENO));
+	else if (curr_job->last_fd != -1)
+		CHECK(dup2(curr_job->pipefd[curr_job->last_fd + INFD], STDIN_FILENO));
 
 	//close last pipes only if this is not first process
-	if (*last != -1){
-		CHECK(close(pipefd[*last + INFD]));
-		CHECK(close(pipefd[*last + OUTFD]));
+	if (curr_job->last_fd != -1){
+		CHECK(close(curr_job->pipefd[curr_job->last_fd + INFD]));
+		CHECK(close(curr_job->pipefd[curr_job->last_fd + OUTFD]));
 	}
 	//always close current pipes
-	CHECK(close(pipefd[*current + INFD]));
-	CHECK(close(pipefd[*current + OUTFD]));
+	CHECK(close(curr_job->pipefd[curr_job->current_fd + INFD]));
+	CHECK(close(curr_job->pipefd[curr_job->current_fd + OUTFD]));
 	char full_path[LINELEN];
-	if (!get_full_path(full_path, curr_process->program_name))
+	if (!get_full_path(full_path, curr_job->curr_process->program_name))
 		fprintf(stderr, "%s\n", FILE_NOT_FOUND_MSG);
 	else
-		CHECK(execve(full_path, curr_process->argument_list, envp));
+		CHECK(execve(full_path, curr_job->curr_process->argument_list, envp));
 	exit(EXIT_FAILURE);
 }
 
@@ -329,21 +329,11 @@ int prepare_job(job *curr_job){
 			//change shell's pgrp to current foreground so that it can rescue its self later
 			setpgid(0, curr_job->pgrp);
 		}
-	}else
-		CHECK(setpgid(curr_job->pid, curr_job->pgrp));
+	}else{
+		if (curr_job->mode == FOREGROUND && getpgid(curr_job->pid) != curr_job->pgrp)
+			CHECK(setpgid(curr_job->pid, curr_job->pgrp));
+	}
 	//wait
-	if (curr_job->last_fd != -1){
-		//not first process
-		CHECK(close(curr_job->pipefd[curr_job->last_fd + INFD]));
-		CHECK(close(curr_job->pipefd[curr_job->last_fd + OUTFD]));
-	}
-	if (curr_job->curr_process->next == NULL){
-		//last process
-		CHECK(close(curr_job->pipefd[curr_job->current_fd+OUTFD]));
-		CHECK(close(curr_job->pipefd[curr_job->current_fd+INFD]));
-	}
-	if (curr_job->last_fd == -1)
-		curr_job->last_fd = 2;
 	int status;
 	CHECK(waitpid(curr_job->pid, &status, WUNTRACED));
 	if (WIFEXITED(status)){
@@ -369,6 +359,18 @@ int prepare_job(job *curr_job){
 		//dont close pipe
 		return 1;
 	}
+	if (curr_job->last_fd != -1){
+		//not first process
+		CHECK(close(curr_job->pipefd[curr_job->last_fd + INFD]));
+		CHECK(close(curr_job->pipefd[curr_job->last_fd + OUTFD]));
+	}
+	if (curr_job->curr_process->next == NULL){
+		//last process
+		CHECK(close(curr_job->pipefd[curr_job->current_fd+OUTFD]));
+		CHECK(close(curr_job->pipefd[curr_job->current_fd+INFD]));
+	}
+	if (curr_job->last_fd == -1)
+		curr_job->last_fd = 2;
 	int tmp = curr_job->current_fd;
 	curr_job->current_fd = curr_job->last_fd;
 	curr_job->last_fd = tmp;
@@ -387,23 +389,24 @@ void execute_job_(job *curr_job, char *envp[]){
 	}
 	//loop
 	for(curr_job->curr_process = curr_job->status == JOB_STOPPED ? curr_job->curr_process : curr_job->process_list; curr_job->curr_process != NULL; curr_job->curr_process = curr_job->curr_process->next){
-		if (pipe(curr_job->pipefd + curr_job->current_fd) == -1){
-			perror("pipe");
-			break;
-		}
 		//connect input of pipefd[0] <-> output of pipefd[1]
 		if (curr_job->status == JOB_STOPPED){
+			curr_job->status = JOB_RUNNING;
 			//continue last stopped process
 			kill(curr_job->pid, SIGCONT);
 			//this pid'parent child currently not grpid
 			//change its parent to grpid -> IMPOSSIBLE
 		}else{
+			curr_job->status = JOB_RUNNING;
+			if (pipe(curr_job->pipefd + curr_job->current_fd) == -1){
+				perror("pipe");
+				break;
+			}
 			curr_job->pid = fork();
 		}
-		curr_job->status = JOB_RUNNING;
 		if (curr_job->pid == 0){
 			//child
-			execute_process(curr_job->curr_process, curr_job->pipefd, &curr_job->current_fd, &curr_job->last_fd, envp);
+			execute_process(curr_job, envp);
 		}else{
 			if (curr_job->pid == -1){
 				perror("fork");
@@ -463,8 +466,7 @@ void execute_job_list(job* curr_job, char *envp[], queue_t *background_jobs){
 	arg->curr_job = curr_job;
 	arg->envp = envp;
 	arg->background_jobs = background_jobs;
-	pthread_t thread;
-	if (pthread_create(&thread, NULL, execute_job_cb, arg) == -1){
+	if (pthread_create(&curr_job->thread, NULL, execute_job_cb, arg) == -1){
 		perror("pthread_create");
 		free_job(curr_job);
 		free(arg);
@@ -474,19 +476,22 @@ void execute_job_list(job* curr_job, char *envp[], queue_t *background_jobs){
 	if (curr_job->mode == FOREGROUND){
 		//foreground
 		void *result;
-		pthread_join(thread, &result);
+		pthread_join(curr_job->thread, &result);
 		if (curr_job->status == JOB_STOPPED){
 			//only push to queue if this is first time job launched
-			if (!is_first_run)
+			if (is_first_run)
 				queue_push_back(background_jobs, curr_job);
+			curr_job->mode = BACKGROUND;
 		}else{
 			//remove from background jobs queue if this is not first run
 			if (!is_first_run){
-				//free_job will be called from the next method
 				queue_remove_by_data(background_jobs, curr_job);
+				//this job might be added to queue again
+			}else{
+				//already in queue
 			}
-			else
-				free_job(curr_job);
+			
+			free_job(curr_job);
 		}
 	}else{
 		//run background
@@ -496,9 +501,7 @@ void execute_job_list(job* curr_job, char *envp[], queue_t *background_jobs){
 			//from second run (continued by fg or bg), job has already been added to queue
 			queue_push_back(background_jobs, curr_job);
 		else{
-			//NOT sure yet
-			//brought to foreground by fg
-			//change mode to foreground
+			//continued from last stopped (in foreground)
 		}
 	}
 }
@@ -526,5 +529,6 @@ int job_bg(char *envp[], queue_t *background_jobs){
 int job_fg(char *envp[], queue_t *background_jobs){
 	return 0;
 }
+//kill remain jobs
 void kill_job(job* curr_job){
 }

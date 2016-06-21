@@ -8,6 +8,7 @@
 #define FILE_NOT_FOUND_MSG "File not found"
 #include <signal.h>
 #include "queue.h"
+#include <pthread.h>
 
 typedef enum write_option_ {
     TRUNC,
@@ -48,7 +49,8 @@ typedef struct job_ {
 	process* curr_process;
 	job_status_t status;
 	int pipefd[4];
-	int current_fd, last_fd;
+	int current_fd, last_fd; 
+    pthread_t thread;
 } job;
 void setup_job_handler();
 
