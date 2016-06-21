@@ -67,5 +67,6 @@ void execute_job_list(job*, char *[], queue_t*);
 
 int job_bg(char *[], queue_t*);
 int job_fg(char *[], queue_t*);
+void kill_job(job* curr_job);
 
 #endif

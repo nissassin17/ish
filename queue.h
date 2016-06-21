@@ -10,7 +10,6 @@ typedef struct queue_node_t_ {
 typedef struct {
 	queue_node_t *front, *back;
 	pthread_mutex_t lock;
-	void (*data_destroy_cb)(void*);
 } queue_t;
 
 queue_t *queue_create();
@@ -21,7 +20,6 @@ void *queue_pop_front(queue_t*);
 
 void queue_destroy(queue_t*);
 
-void queue_set_data_destroy_cb(queue_t*, void (*)(void*));
 
 int queue_is_empty(queue_t*);
 

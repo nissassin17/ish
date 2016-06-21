@@ -5,17 +5,11 @@
 
 void print_job_list(job*);
 
-void free_job_cb(void *vjob){
-	job *jjob = vjob;
-	free_job(jjob);
-}
-
 int main(int argc, char *argv[], char *envp[]) {
     char s[LINELEN];
 	setup_job_handler();
     job *curr_job;
 	queue_t *background_jobs = queue_create();
-	queue_set_data_destroy_cb(background_jobs, free_job_cb);
 
     while(get_line(s, LINELEN)) {
         if (!strcmp(s, "\n"))
@@ -48,6 +42,9 @@ int main(int argc, char *argv[], char *envp[]) {
 
     }
 
+	while(!queue_empty(background_jobs)){
+		kill_job(queue_pop_front(background_jobs));
+	}
 	queue_destroy(background_jobs);
 
     return 0;

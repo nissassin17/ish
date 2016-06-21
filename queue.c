@@ -4,7 +4,6 @@
 queue_t *queue_create(){
 	queue_t *queue = malloc(sizeof(queue_t));
 	queue->front = queue->back = NULL;
-	queue->data_destroy_cb = NULL;
 	pthread_mutex_init(&queue->lock, NULL);
 	return queue;
 }
@@ -57,8 +56,7 @@ void *queue_pop_front(queue_t *queue){
 
 void queue_destroy(queue_t *queue){
 	while (!queue_is_empty(queue))
-		if (queue->data_destroy_cb != NULL)
-			queue->data_destroy_cb(queue_pop_front(queue));
+		queue_pop_front(queue);
 	free(queue);
 }
 
@@ -69,11 +67,6 @@ int queue_is_empty(queue_t *queue){
 	return ret;
 }
 
-void queue_set_data_destroy_cb(queue_t *queue, void (*data_destroy_cb)(void*)){
-	queue_lock(queue);
-	queue->data_destroy_cb = data_destroy_cb;
-	queue_unlock(queue);
-}
 
 void *queue_filter(queue_t *queue, int (*asserter)(void*)){
 	queue_lock(queue);

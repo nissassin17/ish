@@ -526,3 +526,5 @@ int job_bg(char *envp[], queue_t *background_jobs){
 int job_fg(char *envp[], queue_t *background_jobs){
 	return 0;
 }
+void kill_job(job* curr_job){
+}
