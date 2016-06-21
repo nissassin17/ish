@@ -261,21 +261,6 @@ char *get_full_path(char *full_path, char *program_name){
 }
 
 
-void sigchld_handler(int sig){
-	int status;
-	waitpid(WAIT_ANY, &status, WNOHANG | WUNTRACED);
-}
-void setup_zombier_cleaner(){
-	return;
-	struct sigaction handler;
-	handler.sa_handler = sigchld_handler;
-	handler.sa_flags = 0;
-	sigset_t empty;
-	sigemptyset(&empty);
-	handler.sa_mask = empty;
-	sigaction(SIGCHLD, &handler, NULL);
-}
-
 void execute_process(process *curr_process, int *pipefd, int *current, int *last, char *envp[]){
 	//unblock signals
 	sigset_t mask;
@@ -455,8 +440,6 @@ void setup_job_handler(){
 	sigaddset(&mask, SIGTTOU);
 	CHECK(sigprocmask(SIG_BLOCK, &mask, NULL));
 
-	//zombier cleaner
-	setup_zombier_cleaner();
 }
 
 typedef struct {
