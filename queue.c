@@ -56,11 +56,9 @@ void *queue_pop_front(queue_t *queue){
 }
 
 void queue_destroy(queue_t *queue){
-	queue_lock(queue);
 	while (!queue_is_empty(queue))
 		if (queue->data_destroy_cb != NULL)
 			queue->data_destroy_cb(queue_pop_front(queue));
-	queue_unlock(queue);
 	free(queue);
 }
 

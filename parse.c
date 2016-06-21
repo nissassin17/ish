@@ -340,7 +340,7 @@ int prepare_job(job *curr_job){
 			//bring to front
 			CHECK(tcsetpgrp(STDIN_FILENO, curr_job->pgrp));
 			//change shell's pgrp to current foreground so that it can rescue its self later
-			setpgid(getpid(), curr_job->pgrp);
+			setpgid(0, curr_job->pgrp);
 		}
 	}else
 		CHECK(setpgid(curr_job->pid, curr_job->pgrp));
@@ -389,7 +389,7 @@ int prepare_job(job *curr_job){
 }
 
 //in a shell's thread
-int execute_job_(job *curr_job, char *envp[]){
+void execute_job_(job *curr_job, char *envp[]){
 	int shell_pgrp = getpgrp();
 	if (curr_job->status == JOB_NOTRUN){
 		//first run setup
@@ -436,15 +436,16 @@ int execute_job_(job *curr_job, char *envp[]){
 	//NOTE NOTE NOTE: cannot restore shell to foreground without wrapping process by another fork
 	//restore shell to foreground
 	if (curr_job->mode == FOREGROUND){
+		pid_t shell_pid = getpid();
 		pid_t pid = fork();
 		if (pid == 0){
 			//child
+			setpgid(shell_pid, shell_pgrp);
 			CHECK(tcsetpgrp(STDIN_FILENO, shell_pgrp));
 			exit(EXIT_SUCCESS);
 		}else if (pid == -1) perror("fork");
 		else{
 			//restore old pgrp
-			setpgid(getpid(), shell_pgrp);
 			int status;
 			waitpid(pid, &status, 0);
 		}
@@ -452,7 +453,6 @@ int execute_job_(job *curr_job, char *envp[]){
 	if (curr_job->status != JOB_STOPPED){
 		curr_job->status = JOB_FINISHED;
 	}
-	return curr_job->status;
 }
 
 void setup_job_handler(){
@@ -512,7 +512,6 @@ void execute_job_list(job* curr_job, char *envp[], queue_t *background_jobs){
 			}
 			else
 				free_job(curr_job);
-
 		}
 	}else{
 		//run background
