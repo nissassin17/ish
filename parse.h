@@ -44,6 +44,7 @@ typedef struct job_ {
     struct job_* next;
 
 	pid_t pid;
+	pid_t pgrp;
 	process* curr_process;
 	job_status_t status;
 	int pipefd[4];

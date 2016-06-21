@@ -13,6 +13,9 @@
 #include <pthread.h>
 #include "common.h"
 
+#define INFD 0
+#define OUTFD 1
+
 /* 標準入力から最大size-1個の文字を改行またはEOFまで読み込み、sに設定する */
 char* get_line(char *s, int size) {
 
@@ -281,7 +284,6 @@ void execute_process(process *curr_process, int *pipefd, int *current, int *last
 	CHECK(sigprocmask(SIG_UNBLOCK, &mask, NULL));
 
 	int fd;
-	const int infd = 0, outfd = 1;
 	//setup output
 	if (curr_process->output_redirection != NULL){
 		mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH;
@@ -298,7 +300,7 @@ void execute_process(process *curr_process, int *pipefd, int *current, int *last
 		CHECK(close(fd));
 	}else
 		if (curr_process->next != NULL)
-			CHECK(dup2(pipefd[*current + outfd], STDOUT_FILENO));
+			CHECK(dup2(pipefd[*current + OUTFD], STDOUT_FILENO));
 	//setup input
 	if (curr_process->input_redirection != NULL){
 		int fd = open(curr_process->input_redirection, O_RDONLY);
@@ -311,16 +313,16 @@ void execute_process(process *curr_process, int *pipefd, int *current, int *last
 		}
 	}
 	else if (*last != -1)
-		CHECK(dup2(pipefd[*last + infd], STDIN_FILENO));
+		CHECK(dup2(pipefd[*last + INFD], STDIN_FILENO));
 
 	//close last pipes only if this is not first process
 	if (*last != -1){
-		CHECK(close(pipefd[*last + infd]));
-		CHECK(close(pipefd[*last + outfd]));
+		CHECK(close(pipefd[*last + INFD]));
+		CHECK(close(pipefd[*last + OUTFD]));
 	}
 	//always close current pipes
-	CHECK(close(pipefd[*current + infd]));
-	CHECK(close(pipefd[*current + outfd]));
+	CHECK(close(pipefd[*current + INFD]));
+	CHECK(close(pipefd[*current + OUTFD]));
 	char full_path[LINELEN];
 	if (!get_full_path(full_path, curr_process->program_name))
 		fprintf(stderr, "%s\n", FILE_NOT_FOUND_MSG);
@@ -329,28 +331,81 @@ void execute_process(process *curr_process, int *pipefd, int *current, int *last
 	exit(EXIT_FAILURE);
 }
 
+int prepare_job(job *curr_job){
+	if (curr_job->pgrp == -1){
+		//first job after stopped or when start from begin
+		curr_job->pgrp = curr_job->pid;
+		CHECK(setpgid(curr_job->pid, curr_job->pgrp));
+		if (curr_job->mode == FOREGROUND){
+			//bring to front
+			CHECK(tcsetpgrp(STDIN_FILENO, curr_job->pgrp));
+			//change shell's pgrp to current foreground so that it can rescue its self later
+			setpgid(getpid(), curr_job->pgrp);
+		}
+	}else
+		CHECK(setpgid(curr_job->pid, curr_job->pgrp));
+	//wait
+	if (curr_job->last_fd != -1){
+		//not first process
+		CHECK(close(curr_job->pipefd[curr_job->last_fd + INFD]));
+		CHECK(close(curr_job->pipefd[curr_job->last_fd + OUTFD]));
+	}
+	if (curr_job->curr_process->next == NULL){
+		//last process
+		CHECK(close(curr_job->pipefd[curr_job->current_fd+OUTFD]));
+		CHECK(close(curr_job->pipefd[curr_job->current_fd+INFD]));
+	}
+	if (curr_job->last_fd == -1)
+		curr_job->last_fd = 2;
+	int status;
+	CHECK(waitpid(curr_job->pid, &status, WUNTRACED));
+	if (WIFEXITED(status)){
+		//printf("exited: %d\n", WEXITSTATUS(status));
+		//normal exit
+		if (WEXITSTATUS(status)){
+			//notify if not the last
+			if (curr_job->curr_process->next != NULL){
+				fprintf(stderr, "Interrupted due to error\n");
+				return 1;
+			}
+		}
+	}else if (WIFSIGNALED(status)){
+		//printf("signaled: %d\n", WTERMSIG(status));
+		//exit by signal
+		return 1;
+	}else{
+		//printf("stopped: %d\n", WSTOPSIG(status));
+		//WIFSTOPPED
+		//by ctrl-z
+		//restore foreground
+		curr_job->status = JOB_STOPPED;
+		//dont close pipe
+		return 1;
+	}
+	int tmp = curr_job->current_fd;
+	curr_job->current_fd = curr_job->last_fd;
+	curr_job->last_fd = tmp;
+	return 0;
+}
+
 //in a shell's thread
 int execute_job_(job *curr_job, char *envp[]){
-	process *curr_process;
 	int shell_pgrp = getpgrp();
-	int job_pgrp = -1;
-	const int infd = 0, outfd = 1;
-	//setpgid(grpid, grpid); //-> already setup outside
-	//loop
 	if (curr_job->status == JOB_NOTRUN){
 		//first run setup
 		curr_job->status = JOB_RUNNING;
 		curr_job->current_fd = 0;
 		curr_job->last_fd = -1;
+		curr_job->pgrp = -1;
 	}
-	for(curr_process = curr_job->status == JOB_STOPPED ? curr_job->curr_process : curr_job->process_list; curr_process != NULL; curr_process = curr_process->next){
+	//loop
+	for(curr_job->curr_process = curr_job->status == JOB_STOPPED ? curr_job->curr_process : curr_job->process_list; curr_job->curr_process != NULL; curr_job->curr_process = curr_job->curr_process->next){
 		if (pipe(curr_job->pipefd + curr_job->current_fd) == -1){
-			curr_job->status = JOB_FINISHED;
 			perror("pipe");
+			break;
 		}
 		//connect input of pipefd[0] <-> output of pipefd[1]
 		if (curr_job->status == JOB_STOPPED){
-			curr_job->pid = curr_job->pid;
 			//continue last stopped process
 			kill(curr_job->pid, SIGCONT);
 			//this pid'parent child currently not grpid
@@ -361,70 +416,19 @@ int execute_job_(job *curr_job, char *envp[]){
 		curr_job->status = JOB_RUNNING;
 		if (curr_job->pid == 0){
 			//child
-			execute_process(curr_process, curr_job->pipefd, &curr_job->current_fd, &curr_job->last_fd, envp);
+			execute_process(curr_job->curr_process, curr_job->pipefd, &curr_job->current_fd, &curr_job->last_fd, envp);
 		}else{
 			if (curr_job->pid == -1){
 				perror("fork");
 				//close pipes
-				CHECK(close(curr_job->pipefd[curr_job->current_fd + infd]));
-				CHECK(close(curr_job->pipefd[curr_job->current_fd + outfd]));
+				CHECK(close(curr_job->pipefd[curr_job->current_fd + INFD]));
+				CHECK(close(curr_job->pipefd[curr_job->current_fd + OUTFD]));
 				break;
 			}
 			else{
 				//parent
-				if (job_pgrp == -1){
-					//first job after stopped or when start from begin
-					job_pgrp = curr_job->pid;
-					CHECK(setpgid(curr_job->pid, job_pgrp));
-					if (curr_job->mode == FOREGROUND){
-						//bring to front
-						CHECK(tcsetpgrp(STDIN_FILENO, job_pgrp));
-						//change shell's pgrp to current foreground so that it can rescue its self later
-						setpgid(getpid(), job_pgrp);
-					}
-				}else
-				CHECK(setpgid(curr_job->pid, job_pgrp));
-				//wait
-				if (curr_job->last_fd != -1){
-					//not first process
-					CHECK(close(curr_job->pipefd[curr_job->last_fd + infd]));
-					CHECK(close(curr_job->pipefd[curr_job->last_fd + outfd]));
-				}
-				if (curr_process->next == NULL){
-					//last process
-					CHECK(close(curr_job->pipefd[curr_job->current_fd+outfd]));
-					CHECK(close(curr_job->pipefd[curr_job->current_fd+infd]));
-				}
-				if (curr_job->last_fd == -1)
-					curr_job->last_fd = 2;
-				int status;
-				CHECK(waitpid(curr_job->pid, &status, WUNTRACED));
-				if (WIFEXITED(status)){
-					//printf("exited: %d\n", WEXITSTATUS(status));
-					//normal exit
-					if (WEXITSTATUS(status)){
-						//notify if not the last
-						if (curr_process->next != NULL){
-							fprintf(stderr, "Interrupted due to error\n");
-							break;
-						}
-					}
-				}else if (WIFSIGNALED(status)){
-					//printf("signaled: %d\n", WTERMSIG(status));
-					//exit by signal
-					break;
-				}else{
-					//printf("stopped: %d\n", WSTOPSIG(status));
-					//WIFSTOPPED
-					//by ctrl-z
-					//restore foreground
-					curr_job->status = JOB_STOPPED;
-					//dont close pipe
-					break;
-				}
-				int tmp = curr_job->current_fd;
-				curr_job->current_fd = curr_job->last_fd;
-				curr_job->last_fd = tmp;
+				if (prepare_job(curr_job))
+						break;
 			}
 		}
 	}
@@ -432,9 +436,18 @@ int execute_job_(job *curr_job, char *envp[]){
 	//NOTE NOTE NOTE: cannot restore shell to foreground without wrapping process by another fork
 	//restore shell to foreground
 	if (curr_job->mode == FOREGROUND){
-		CHECK(tcsetpgrp(STDIN_FILENO, shell_pgrp));
-		//restore old pgrp
-		setpgid(getpid(), shell_pgrp);
+		pid_t pid = fork();
+		if (pid == 0){
+			//child
+			CHECK(tcsetpgrp(STDIN_FILENO, shell_pgrp));
+			exit(EXIT_SUCCESS);
+		}else if (pid == -1) perror("fork");
+		else{
+			//restore old pgrp
+			setpgid(getpid(), shell_pgrp);
+			int status;
+			waitpid(pid, &status, 0);
+		}
 	}
 	if (curr_job->status != JOB_STOPPED){
 		curr_job->status = JOB_FINISHED;
