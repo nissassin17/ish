@@ -266,6 +266,7 @@ void sigchld_handler(int sig){
 	waitpid(WAIT_ANY, &status, WNOHANG | WUNTRACED);
 }
 void setup_zombier_cleaner(){
+	return;
 	struct sigaction handler;
 	handler.sa_handler = sigchld_handler;
 	handler.sa_flags = 0;
@@ -281,6 +282,7 @@ void execute_process(process *curr_process, int *pipefd, int *current, int *last
 	sigemptyset(&mask);
 	sigaddset(&mask, SIGINT);
 	sigaddset(&mask, SIGTSTP);
+	sigaddset(&mask, SIGTTOU);
 	CHECK(sigprocmask(SIG_UNBLOCK, &mask, NULL));
 
 	int fd;
@@ -436,19 +438,8 @@ void execute_job_(job *curr_job, char *envp[]){
 	//NOTE NOTE NOTE: cannot restore shell to foreground without wrapping process by another fork
 	//restore shell to foreground
 	if (curr_job->mode == FOREGROUND){
-		pid_t shell_pid = getpid();
-		pid_t pid = fork();
-		if (pid == 0){
-			//child
-			setpgid(shell_pid, shell_pgrp);
-			CHECK(tcsetpgrp(STDIN_FILENO, shell_pgrp));
-			exit(EXIT_SUCCESS);
-		}else if (pid == -1) perror("fork");
-		else{
-			//restore old pgrp
-			int status;
-			waitpid(pid, &status, 0);
-		}
+		setpgid(0, shell_pgrp);
+		CHECK(tcsetpgrp(STDIN_FILENO, shell_pgrp));
 	}
 	if (curr_job->status != JOB_STOPPED){
 		curr_job->status = JOB_FINISHED;
@@ -461,6 +452,7 @@ void setup_job_handler(){
 	sigemptyset(&mask);
 	sigaddset(&mask, SIGINT);
 	sigaddset(&mask, SIGTSTP);
+	sigaddset(&mask, SIGTTOU);
 	CHECK(sigprocmask(SIG_BLOCK, &mask, NULL));
 
 	//zombier cleaner
